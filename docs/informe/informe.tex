@@ -134,7 +134,7 @@ mejora.
 Todas las respuestas de la API, exitosas o de error, siguen la misma forma,
 implementada como el \emph{record} genérico \texttt{ApiResponse<T>}:
 
-\begin{lstlisting}[language=json]
+\begin{lstlisting}
 {
   "success": true,
   "data": [ ... ],
@@ -146,7 +146,7 @@ implementada como el \emph{record} genérico \texttt{ApiResponse<T>}:
 En una respuesta de error, el campo \texttt{errors} (lista de
 \texttt{\{field, message\}}) reemplaza a \texttt{data}/\texttt{meta}:
 
-\begin{lstlisting}[language=json]
+\begin{lstlisting}
 {
   "success": false,
   "message": "Error de validacion",
