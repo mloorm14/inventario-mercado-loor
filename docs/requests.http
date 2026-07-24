@@ -1,0 +1,179 @@
+### ============================================================
+### Inventario Mercado Loor — Colección de pruebas HTTP
+### Examen Parcial Aplicaciones Web — UTEQ
+### Requiere: docker compose up -d --build (ver README.md)
+### ============================================================
+
+@baseUrl = http://localhost:8080
+@adminUser = admin.mercado
+@adminPass = Admin#Quevedo2026
+@userUser = usuario.mercado
+@userPass = User#Quevedo2026
+
+### ------------------------------------------------------------
+### 1. LOGIN — admin.mercado (público)
+### Evidencia: docs/capturas/01-login-200.png
+### ------------------------------------------------------------
+# @name loginAdmin
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "username": "{{adminUser}}",
+  "password": "{{adminPass}}"
+}
+
+### Respuesta esperada: 200 OK
+# {
+#   "success": true,
+#   "data": { "token": "eyJ..." },
+#   "message": "Login exitoso"
+# }
+# Copiar el token de la respuesta y usarlo como Bearer en las pruebas siguientes.
+
+
+### ------------------------------------------------------------
+### 2. LOGIN — usuario.mercado (público, ROLE_USER)
+### ------------------------------------------------------------
+# @name loginUsuario
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "username": "{{userUser}}",
+  "password": "{{userPass}}"
+}
+
+### Respuesta esperada: 200 OK, token con rol ROLE_USER
+
+
+### ------------------------------------------------------------
+### 3. GET listado paginado — SIN token
+### Requisito: sin token debe devolver 401
+### Evidencia: docs/capturas/04-get-401-sin-token.png (PENDIENTE)
+### ------------------------------------------------------------
+GET {{baseUrl}}/api/v1/productos?page=0&size=10&sort=nombre,asc
+
+### Respuesta esperada: 401 Unauthorized
+# {
+#   "success": false,
+#   "message": "No autenticado. Se requiere un token JWT valido."
+# }
+
+
+### ------------------------------------------------------------
+### 4. GET listado paginado — CON token (ROLE_ADMIN o ROLE_USER)
+### Evidencia: docs/capturas/02-get-200-con-token.png
+### ------------------------------------------------------------
+GET {{baseUrl}}/api/v1/productos?page=0&size=10&sort=nombre,asc
+Authorization: Bearer {{$dotenv ADMIN_TOKEN}}
+
+### Respuesta esperada: 200 OK con envoltura {success, data, message, meta}
+
+
+### ------------------------------------------------------------
+### 5. POST crear producto — CON token de ROLE_USER (rol insuficiente)
+### Requisito: rol insuficiente debe devolver 403
+### Evidencia: docs/capturas/03-post-403-rol-insuficiente.png
+### ------------------------------------------------------------
+POST {{baseUrl}}/api/v1/productos
+Authorization: Bearer {{$dotenv USER_TOKEN}}
+Content-Type: application/json
+
+{
+  "nombre": "Arroz flor",
+  "categoria": "Granos",
+  "stock": 120,
+  "precio": 0.95
+}
+
+### Respuesta esperada: 403 Forbidden
+# {
+#   "success": false,
+#   "message": "Acceso denegado. No tiene permisos suficientes."
+# }
+
+
+### ------------------------------------------------------------
+### 6. POST crear producto — body INVÁLIDO (con ROLE_ADMIN)
+### Requisito: validación @Valid debe devolver 400 con errores por campo
+### Evidencia: docs/capturas/05-post-400-validacion.png (PENDIENTE)
+### ------------------------------------------------------------
+POST {{baseUrl}}/api/v1/productos
+Authorization: Bearer {{$dotenv ADMIN_TOKEN}}
+Content-Type: application/json
+
+{
+  "nombre": "",
+  "categoria": "Granos",
+  "stock": -5,
+  "precio": 0
+}
+
+### Respuesta esperada: 400 Bad Request
+# {
+#   "success": false,
+#   "message": "Error de validacion",
+#   "errors": [
+#     { "field": "nombre", "message": "..." },
+#     { "field": "stock", "message": "..." },
+#     { "field": "precio", "message": "..." }
+#   ]
+# }
+
+
+### ------------------------------------------------------------
+### 7. POST crear producto — body VÁLIDO (con ROLE_ADMIN)
+### Evidencia: docs/capturas/06-post-201-creado.png (PENDIENTE)
+### Guardar el "id" devuelto para usarlo en las pruebas 8 y 9.
+### ------------------------------------------------------------
+POST {{baseUrl}}/api/v1/productos
+Authorization: Bearer {{$dotenv ADMIN_TOKEN}}
+Content-Type: application/json
+
+{
+  "nombre": "Platano",
+  "categoria": "Frutas",
+  "stock": 10,
+  "precio": 0.50
+}
+
+### Respuesta esperada: 201 Created con el producto creado (incluye "id")
+
+
+### ------------------------------------------------------------
+### 8. DELETE soft delete — id existente (con ROLE_ADMIN)
+### Requisito: activo = false, sin borrado físico
+### Evidencia: docs/capturas/07-delete-200.png (PENDIENTE)
+### Reemplazar {id} por el id devuelto en la prueba 7.
+### ------------------------------------------------------------
+DELETE {{baseUrl}}/api/v1/productos/{id}
+Authorization: Bearer {{$dotenv ADMIN_TOKEN}}
+
+### Respuesta esperada: 200 OK
+# { "success": true, "data": null, "message": "Producto eliminado correctamente" }
+
+
+### ------------------------------------------------------------
+### 9. DELETE soft delete — id INEXISTENTE (con ROLE_ADMIN)
+### Requisito: id no existe debe devolver 404 con mensaje descriptivo
+### Evidencia: docs/capturas/08-delete-404.png (PENDIENTE)
+### ------------------------------------------------------------
+DELETE {{baseUrl}}/api/v1/productos/9999
+Authorization: Bearer {{$dotenv ADMIN_TOKEN}}
+
+### Respuesta esperada: 404 Not Found
+# { "success": false, "message": "Producto con id 9999 no encontrado" }
+
+
+### ------------------------------------------------------------
+### 10. Cache-aside — verificación hit/miss en Redis
+### Evidencia: docs/capturas/09-cache-hit-miss.png (PENDIENTE)
+### Ejecutar dos veces esta misma petición y verificar en Redis con:
+###   docker exec inventario-mercado-loor-redis-1 redis-cli KEYS "productos*"
+### La clave "productos::page:0:size:10:sort:..." debe existir tras el
+### primer GET (cache miss -> escribe) y servir el segundo desde cache
+### (cache hit) sin volver a consultar Postgres.
+### ------------------------------------------------------------
+GET {{baseUrl}}/api/v1/productos?page=0&size=10&sort=nombre,asc
+Authorization: Bearer {{$dotenv ADMIN_TOKEN}}
