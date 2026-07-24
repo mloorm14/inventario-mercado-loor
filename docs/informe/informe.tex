@@ -1,0 +1,302 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish]{babel}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    columns=fullflexible,
+    backgroundcolor=\color{gray!10}
+}
+
+\title{Informe técnico\\
+Sistema de gestión de inventario del Mercado Municipal de Quevedo}
+\author{Loor Marlon \\ Universidad Técnica Estatal de Quevedo (UTEQ) \\ Aplicaciones Web}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Este informe describe el diseño técnico del sistema de gestión de inventario
+desarrollado para el examen parcial de Aplicaciones Web: una API REST construida
+con Spring Boot 3.5.16 sobre Java 21, con autenticación y autorización basadas en
+JSON Web Tokens (JWT), persistencia en PostgreSQL, y una capa de cache con Redis
+bajo el patrón \emph{cache-aside}. Se documentan la arquitectura por capas, el
+contrato de respuesta uniforme de la API, el modelo de datos, y las decisiones de
+seguridad y de caché tomadas durante la implementación.
+\end{abstract}
+
+\section{Introducción}
+
+El sistema permite gestionar el inventario de productos del Mercado Municipal de
+Quevedo mediante una API REST protegida por autenticación JWT. Los requisitos
+funcionales cubiertos son: listado paginado de productos, creación validada,
+eliminación lógica (\emph{soft delete}), autorización basada en roles
+(\texttt{ROLE\_USER} / \texttt{ROLE\_ADMIN}), y una capa de cache con Redis para
+reducir la carga sobre la base de datos en las operaciones de lectura.
+
+Todo el sistema se distribuye mediante Docker Compose, con tres servicios:
+la aplicación Spring Boot (\texttt{app}), PostgreSQL 16 (\texttt{postgres}) y
+Redis 7 (\texttt{redis}).
+
+\section{Arquitectura por capas}
+
+El proyecto sigue una arquitectura por capas convencional, separando
+responsabilidades para que cada componente tenga un único motivo de cambio:
+
+\begin{itemize}[noitemsep]
+    \item \textbf{\texttt{domain}}: entidades JPA (\texttt{Producto},
+        \texttt{Usuario}) que mapean directamente las tablas de la base de datos.
+    \item \textbf{\texttt{repository}}: interfaces \texttt{JpaRepository}
+        (\texttt{ProductoRepository}, \texttt{UsuarioRepository}). Es el
+        \emph{único} punto de acceso a datos: ni los controladores ni los
+        servicios ejecutan consultas directas.
+    \item \textbf{\texttt{service}}: lógica de negocio y orquestación de caché
+        (\texttt{ProductoService}). Traduce entidades a DTOs de salida.
+    \item \textbf{\texttt{controller}}: adaptadores HTTP delgados
+        (\texttt{ProductoController}, \texttt{AuthController}) que solo mapean
+        peticiones/respuestas y delegan toda la lógica al servicio.
+    \item \textbf{\texttt{dto}}: objetos de transferencia (\texttt{ProductoRequest},
+        \texttt{ProductoResponse}, \texttt{ApiResponse}, etc.), implementados como
+        \emph{records} de Java 21 por su inmutabilidad y menor código repetitivo.
+    \item \textbf{\texttt{security}}: todo lo relacionado con JWT y Spring
+        Security (\texttt{JwtService}, \texttt{JwtAuthenticationFilter},
+        \texttt{SecurityConfig}, manejadores de errores de autenticación).
+    \item \textbf{\texttt{web}}: manejo centralizado de excepciones
+        (\texttt{GlobalExceptionHandler}) que traduce cualquier excepción de la
+        capa de negocio al contrato de respuesta uniforme de la API.
+    \item \textbf{\texttt{config}}: configuración de infraestructura transversal,
+        como la caché de Redis (\texttt{CacheConfig}).
+\end{itemize}
+
+Esta separación seaproxima a los principios de diseño de APIs orientadas a
+recursos descritos por Fielding~\cite{fielding2000rest}, en cuanto a que cada
+recurso (\texttt{/api/v1/productos}) se manipula mediante los verbos HTTP
+estándar (\texttt{GET}, \texttt{POST}, \texttt{DELETE}) sin exponer detalles de
+implementación interna al cliente.
+
+\section{Modelo de datos}
+
+El esquema (\texttt{db/schema.sql}) define dos tablas:
+
+\begin{lstlisting}[language=SQL]
+CREATE TABLE productos (
+    id BIGSERIAL PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    categoria VARCHAR(50) NOT NULL,
+    stock INTEGER NOT NULL CHECK (stock >= 0),
+    precio DECIMAL(10,2) NOT NULL CHECK (precio >= 0.01),
+    activo BOOLEAN NOT NULL DEFAULT TRUE,
+    creado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE usuarios (
+    id BIGSERIAL PRIMARY KEY,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    password_hash VARCHAR(100) NOT NULL,
+    role VARCHAR(20) NOT NULL CHECK (role IN ('ROLE_USER', 'ROLE_ADMIN'))
+);
+\end{lstlisting}
+
+Los \texttt{CHECK} de \texttt{stock} y \texttt{precio} garantizan invariantes de
+negocio a nivel de base de datos (no solo en la capa de validación de la API),
+y el borrado de productos es siempre lógico: el campo \texttt{activo} se pone en
+\texttt{false} en lugar de ejecutar un \texttt{DELETE} físico, preservando el
+historial. El listado solo considera productos con \texttt{activo = true}
+(\texttt{ProductoRepository.findByActivoTrue}).
+
+Las contraseñas de \texttt{usuarios} se almacenan con \texttt{BCrypt}
+(\texttt{password\_hash}), siguiendo el esquema adaptativo de
+Provos y Mazières~\cite{provos1999bcrypt}, que incorpora un factor de costo
+configurable para resistir ataques de fuerza bruta a medida que el hardware
+mejora.
+
+\section{Contrato de respuesta uniforme}
+
+Todas las respuestas de la API, exitosas o de error, siguen la misma forma,
+implementada como el \emph{record} genérico \texttt{ApiResponse<T>}:
+
+\begin{lstlisting}[language=json]
+{
+  "success": true,
+  "data": [ ... ],
+  "message": "Listado obtenido correctamente",
+  "meta": { "page": 0, "size": 20, "totalElements": 57, "totalPages": 3 }
+}
+\end{lstlisting}
+
+En una respuesta de error, el campo \texttt{errors} (lista de
+\texttt{\{field, message\}}) reemplaza a \texttt{data}/\texttt{meta}:
+
+\begin{lstlisting}[language=json]
+{
+  "success": false,
+  "message": "Error de validacion",
+  "errors": [
+    { "field": "nombre", "message": "must not be blank" }
+  ]
+}
+\end{lstlisting}
+
+Se optó por una \'unica clase \texttt{ApiResponse<T>} (con \texttt{meta} y
+\texttt{errors} anotados con \texttt{@JsonInclude(NON\_NULL)}) en lugar de una
+jerarquía de tipos de éxito/error separada, de modo que todos los controladores
+y el manejador global de excepciones devuelvan siempre el mismo tipo, y el
+cliente de la API pueda inspeccionar únicamente el campo \texttt{success} para
+decidir cómo interpretar la respuesta.
+
+\section{Seguridad: autenticación y autorización con JWT}
+
+La autenticación es \emph{stateless}: el cliente obtiene un token mediante
+\texttt{POST /api/v1/auth/login} y lo envía en cada petición protegida con el
+esquema \texttt{Authorization: Bearer <token>}, tal como lo define
+RFC 6750~\cite{rfc6750} para el uso de tokens portador (\emph{bearer tokens}).
+
+El token en sí es un JSON Web Token firmado con HMAC-SHA256, según
+RFC 7519~\cite{rfc7519}, con dos \emph{claims} relevantes además de los
+estándar (\texttt{sub}, \texttt{iat}, \texttt{exp}): el nombre de usuario como
+\emph{subject} y el rol (\texttt{ROLE\_USER} o \texttt{ROLE\_ADMIN}) como claim
+personalizado \texttt{role}. El tiempo de expiración se fijó en una hora,
+un valor razonable para pruebas y demostraciones que limita la ventana de
+exposición si el token se filtra, sin forzar reautenticaciones constantes.
+
+El flujo de autorización sigue el modelo estándar de Spring
+Security~\cite{springsecurity2024}:
+
+\begin{enumerate}[noitemsep]
+    \item \texttt{JwtAuthenticationFilter} (un \texttt{OncePerRequestFilter})
+        intercepta cada petición, extrae el token del header
+        \texttt{Authorization}, y si es válido puebla el
+        \texttt{SecurityContext} con las \emph{authorities} correspondientes.
+    \item Si no hay token o es inválido, el filtro simplemente deja continuar
+        la cadena sin autenticar; es \texttt{AuthorizationFilter} quien más
+        adelante rechaza el acceso a un recurso protegido, delegando el error
+        \texttt{401} a un \texttt{AuthenticationEntryPoint} personalizado.
+    \item Un \texttt{AccessDeniedHandler} personalizado traduce los rechazos
+        por rol insuficiente (\texttt{403}) al mismo contrato
+        \texttt{ApiResponse.error(...)} usado en el resto de la API, en vez del
+        HTML por defecto de Spring Security.
+\end{enumerate}
+
+Las reglas de autorización, definidas en \texttt{SecurityConfig}, son:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Endpoint & Rol requerido & Sin token / rol insuficiente \\
+\midrule
+\texttt{POST /api/v1/auth/login} & público & --- \\
+\texttt{GET /api/v1/productos} & \texttt{ROLE\_USER} o \texttt{ROLE\_ADMIN} & 401 \\
+\texttt{POST /api/v1/productos} & \texttt{ROLE\_ADMIN} & 401 / 403 \\
+\texttt{DELETE /api/v1/productos/\{id\}} & \texttt{ROLE\_ADMIN} & 401 / 403 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Dado que Spring Security no hace que \texttt{ROLE\_ADMIN} herede automáticamente
+las autoridades de \texttt{ROLE\_USER}, el endpoint de listado se declaró
+explícitamente con \texttt{hasAnyRole("USER", "ADMIN")} en lugar de introducir
+una jerarquía de roles (\texttt{RoleHierarchy}) separada: con un único rol por
+usuario en el modelo de datos, esta forma es más directa de auditar en un solo
+lugar.
+
+Como salvaguarda adicional, la construcción de \texttt{GrantedAuthority} a
+partir del valor de rol (ya sea leído de la base de datos o de un claim del
+JWT) se centralizó en un único método utilitario (\texttt{RoleAuthorityUtils})
+que normaliza el prefijo \texttt{ROLE\_} si no está presente, evitando que una
+futura fuente de datos sin ese prefijo rompa la autorización en silencio.
+
+\section{Patrón cache-aside con Redis}
+
+El listado paginado de productos (\texttt{GET /api/v1/productos}) usa el patrón
+\emph{cache-aside}, tal como lo describen tanto la documentación de patrones de
+Azure~\cite{msftcacheaside} como Kleppmann~\cite{kleppmann2017ddia} en su
+discusión sobre sistemas de caché: la aplicación consulta primero la caché: si
+el valor no está (\emph{cache miss}), calcula el resultado consultando la base
+de datos, lo guarda en la caché, y lo devuelve; en peticiones subsecuentes con
+los mismos parámetros de paginación (\emph{cache hit}), el resultado se sirve
+directamente desde Redis sin volver a consultar PostgreSQL.
+
+En la implementación, esto se logra anotando el método de servicio (no el
+controlador) con \texttt{@Cacheable}:
+
+\begin{lstlisting}[language=java]
+@Cacheable(
+    value = "productos",
+    key = "'page:' + #pageable.pageNumber
+         + ':size:' + #pageable.pageSize
+         + ':sort:' + #pageable.sort.toString()"
+)
+public ProductoPageResult listarActivos(Pageable pageable) { ... }
+\end{lstlisting}
+
+La clave de caché incluye página, tamaño y orden para no mezclar resultados de
+distintas combinaciones de paginación bajo la misma entrada. Cualquier
+operación de escritura (\texttt{crear}, \texttt{eliminar}) invalida toda la
+caché de productos con \texttt{@CacheEvict(value = "productos", allEntries =
+true)}, dado que una única entrada modificada puede afectar el conteo total y
+la distribución de varias páginas cacheadas simultáneamente.
+
+Para la serialización se usó un \texttt{Jackson2JsonRedisSerializer} atado al
+tipo concreto \texttt{ProductoPageResult} (en vez del serializador genérico con
+tipado polimórfico de Spring Data Redis), ya que los DTOs del proyecto son
+\emph{records} de Java --- por lo tanto, clases \texttt{final} --- para las que
+la estrategia de tipado por defecto de Jackson omite la metadata de tipo en el
+valor raíz, produciendo un documento que el propio Jackson no puede releer. Al
+conocerse de antemano el único tipo que esta caché almacena, un serializador
+tipado explícito es más simple y evita ese problema por completo.
+
+\section{Manejo centralizado de errores}
+
+\texttt{GlobalExceptionHandler} (\texttt{@RestControllerAdvice}) concentra la
+traducción de excepciones al contrato \texttt{ApiResponse.error(...)}:
+
+\begin{itemize}[noitemsep]
+    \item \texttt{AuthenticationException} (credenciales inválidas en el
+        login) $\rightarrow$ \texttt{401}.
+    \item \texttt{MethodArgumentNotValidException} (fallos de validación de
+        \texttt{@Valid}) $\rightarrow$ \texttt{400}, con la lista de errores
+        por campo.
+    \item \texttt{ProductoNoEncontradoException} (id inexistente en
+        \texttt{DELETE}) $\rightarrow$ \texttt{404}.
+\end{itemize}
+
+Centralizar este mapeo en un único componente evita duplicar la construcción
+de la respuesta de error en cada controlador, y mantiene el formato de salida
+consistente en toda la API.
+
+\section{Conclusiones}
+
+El sistema implementado cubre los cinco requisitos funcionales del examen
+(listado paginado, creación validada, eliminación lógica, autorización basada
+en roles, y caché con Redis) sobre una arquitectura por capas convencional que
+aísla claramente el acceso a datos, la lógica de negocio y la capa HTTP. Las
+decisiones de seguridad (JWT stateless, BCrypt, normalización centralizada de
+roles) y de caché (cache-aside con invalidación total en escritura, y
+serialización tipada para evitar los problemas de tipado polimórfico de
+Jackson con \emph{records}) se documentaron junto con su justificación técnica,
+de forma que puedan auditarse y, si corresponde, revisarse en iteraciones
+futuras del proyecto.
+
+\bibliographystyle{plain}
+\bibliography{referencias}
+
+\end{document}
